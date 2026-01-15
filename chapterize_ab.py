@@ -102,15 +102,16 @@ def verify_language(language: str) -> str:
 def verify_download(language: str, model_type: str) -> str:
     """Verifies that the selected language can be downloaded by the script.
 
-    If the download option is selected, this function verifies that the language
-    model and size are supported by the script.
-
-    :param language: Language of the model to download.
-    :param model_type: Type of model (small or large).
-    :return: String name of the model file to download if supported.
+    For Vosk-backed languages, returns the model archive name.
+    For Whisper-only languages (e.g., da-dk), returns a sentinel in the form 'whisper-<modelname>'.
     """
-
     lang_code = verify_language(language)
+
+    # Whisper-only languages (no Vosk archives)
+    if lang_code == 'da-dk':
+        whisper_name = 'base' if model_type == 'small' else 'large-v3'
+        return f'whisper-{whisper_name}'
+
     name = ''
     found = False
     other = 'small' if model_type == 'large' else 'large'
@@ -497,12 +498,37 @@ def convert_to_wav(audiobook_path: PathLike) -> Path:
 
 
 def download_model(name: str) -> None:
-    """Downloads the specified language model from vosk (if available).
+    """Downloads a model if available.
 
-    :param name: Name of the model found on the vosk website
-    :return: None (void)
+    - Vosk: downloads the specified model zip from alphacephei.com/vosk/models
+    - Whisper: if name starts with 'whisper-', forces Whisper to download/cache the model
     """
+    # Whisper sentinel: whisper-<modelname>
+    if name.startswith('whisper-'):
+        whisper_name = name.split('whisper-', 1)[1].strip()
+        if not whisper_name:
+            con.print("[bold red]CRITICAL:[/] Invalid Whisper model name")
+            sys.exit(31)
 
+        try:
+            import whisper  # openai-whisper
+            import torch
+        except ImportError:
+            con.print(
+                "[bold red]CRITICAL:[/] Whisper support requires extra deps.\n"
+                "Install: [bold green]pip install -U openai-whisper torch[/] "
+                "(and ensure ffmpeg is available)."
+            )
+            sys.exit(32)
+
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        con.print(f"[magenta]Downloading/caching Whisper model[/magenta]: [cyan]{whisper_name}[/] on [green]{device}[/]...")
+        whisper.load_model(whisper_name, device=device)
+        con.print("[bold green]SUCCESS![/] Whisper model cached successfully")
+        print("\n")
+        return
+
+    # --- Vosk downloader (existing behavior) ---
     try:
         import requests
         from requests.exceptions import ConnectionError as ReqConnectionError
@@ -568,6 +594,19 @@ def download_model(name: str) -> None:
     except Exception as e:
         con.print(f"[bold red]CRITICAL:[/] Failed to unpack or rename the model: [red]{e}[/red]")
         sys.exit(29)
+
+def read_text_lines(path: PathLike) -> list[str]:
+    p = Path(path)
+    for enc in ('utf-8-sig', 'utf-8', 'utf-16'):
+        try:
+            with open(p, 'r', encoding=enc, errors='strict') as fp:
+                return fp.readlines()
+        except UnicodeDecodeError:
+            continue
+
+    # last resort: don't crash, but you may lose a few characters
+    with open(p, 'r', encoding='utf-8', errors='replace') as fp:
+        return fp.readlines()
 
 
 def convert_time(time: str) -> str:
@@ -700,19 +739,85 @@ def split_file(audiobook_path: PathLike,
             progress.update(task, advance=1)
 
 
+def _whisper_model_name(model_type: str) -> str:
+    # Map your CLI size choice to Whisper model names
+    return 'base' if model_type == 'small' else 'large-v3'
+
+
+def _format_srt_timestamp(seconds: float) -> str:
+    # Robust to rounding/carry: compute in milliseconds
+    ms_total = int(round(max(0.0, seconds) * 1000.0))
+    s_total, ms = divmod(ms_total, 1000)
+    m_total, s = divmod(s_total, 60)
+    h, m = divmod(m_total, 60)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _write_srt_from_segments(segments: list[dict], out_file: Path) -> None:
+    with open(out_file, 'w', encoding='utf-8') as fp:
+        idx = 1
+        for seg in segments:
+            text = (seg.get('text') or '').strip()
+            if not text:
+                continue
+            start = _format_srt_timestamp(float(seg.get('start', 0.0)))
+            end = _format_srt_timestamp(float(seg.get('end', 0.0)))
+            fp.write(f"{idx}\n{start} --> {end}\n{text}\n\n")
+            idx += 1
+
+
+def generate_timecodes_whisper(audiobook_path: PathLike, language: str, model_type: str) -> Path:
+    """Generate an .srt timecode file using Whisper (for languages without Vosk models)."""
+    out_file = audiobook_path.with_suffix('.srt')
+    if out_file.exists() and out_file.stat().st_size > 10:
+        con.print("[bold green]SUCCESS![/] An existing srt timecode file was found")
+        print("\n")
+        return out_file
+
+    try:
+        import whisper  # openai-whisper
+        import torch
+    except ImportError:
+        con.print(
+            "[bold red]CRITICAL:[/] Danish requires Whisper.\n"
+            "Install: [bold green]pip install -U openai-whisper torch[/] "
+            "(and ensure ffmpeg is available)."
+        )
+        sys.exit(32)
+
+    # Whisper expects ISO-639-1 for language; Danish is 'da'
+    whisper_lang = 'da' if language.lower() == 'da-dk' else None
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model_name = _whisper_model_name(model_type)
+    con.print(f":white_heavy_check_mark: Whisper enabled. Model: [cyan]{model_name}[/] Device: [green]{device}[/]\n")
+
+    model = whisper.load_model(model_name, device=device)
+    result = model.transcribe(
+        str(audiobook_path),
+        language=whisper_lang,
+        task='transcribe',
+        fp16=(device == 'cuda'),
+        verbose=False
+    )
+
+    segments = result.get('segments') or []
+    _write_srt_from_segments(segments, out_file)
+
+    if out_file.exists() and out_file.stat().st_size > 10:
+        con.print("[bold green]SUCCESS![/] Timecode file created (Whisper)\n")
+    else:
+        con.print("[bold red]ERROR:[/] Whisper transcription finished but SRT output is empty\n")
+        sys.exit(7)
+
+    return Path(out_file)
+
+
 def generate_timecodes(audiobook_path: PathLike, language: str, model_type: str) -> Path:
-    """Generate chapter timecodes using vosk Machine Learning API.
-
-    This function searches for the specified model/language within the project's 'models' directory and
-    uses it to perform a speech-to-text conversion on the audiobook, which is then saved in a subrip (srt) file.
-
-    If more than 1 model is present, the script will attempt to guess which one to use based on input.
-
-    :param audiobook_path: Path to input audiobook file
-    :param language: Language used by the parser
-    :param model_type: The type of model (large or small)
-    :return: Path to timecode file
-    """
+    """Generate chapter timecodes using Vosk (default) or Whisper (for da-dk)."""
+    # Whisper-only route
+    if language.lower() == 'da-dk':
+        return generate_timecodes_whisper(audiobook_path, language, model_type)
 
     sample_rate = 16000
     model_root = Path(r"model")
@@ -722,7 +827,6 @@ def generate_timecodes(audiobook_path: PathLike, language: str, model_type: str)
     if out_file.exists() and out_file.stat().st_size > 10:
         con.print("[bold green]SUCCESS![/] An existing srt timecode file was found")
         print("\n")
-
         return out_file
 
     try:
@@ -756,7 +860,6 @@ def generate_timecodes(audiobook_path: PathLike, language: str, model_type: str)
     rec.SetWords(True)
 
     try:
-        # Convert the file to wav (if needed), and stream output to file
         with subprocess.Popen([str(ffmpeg), "-loglevel", "quiet", "-i",
                                audiobook_path,
                                "-ar", str(sample_rate), "-ac", "1", "-f", "s16le", "-"],
@@ -773,18 +876,9 @@ def generate_timecodes(audiobook_path: PathLike, language: str, model_type: str)
 
 
 def parse_timecodes(srt_content: list, language: str = 'en-us') -> list[dict]:
-    """Parse the contents of the srt timecode file.
-
-    Parses the output from `generate_timecodes` and generates start/end times, as well as chapter
-    type (prologue, epilogue, etc.) if available.
-
-    :param srt_content: List of timecodes extracted from the output of vosk
-    :param language: Selected language. Used for importing excluded phrases
-    :return: A list of dictionaries containing start, end, and chapter type data
-    """
-
-    # Get lang specific markers and excluded phrases
+    """Parse the contents of the srt timecode file."""
     excluded_phrases, markers = get_language_features(language)
+
     # If language features are None, they haven't been defined
     if not excluded_phrases or not markers:
         from model.models import get_lang_from_code
@@ -795,37 +889,80 @@ def parse_timecodes(srt_content: list, language: str = 'en-us') -> list[dict]:
         )
         sys.exit(13)
 
+    # Case-insensitive matching (Whisper frequently capitalizes)
+    excluded_lc = tuple(x.lower() for x in excluded_phrases)
+    markers_lc = tuple(m.lower() for m in markers)
+
     timecodes = []
     counter = 1
 
+    def _roman_to_int(s: str) -> int | None:
+        s = s.lower()
+        roman = {'i': 1, 'v': 5, 'x': 10, 'l': 50, 'c': 100, 'd': 500, 'm': 1000}
+        if not s or any(ch not in roman for ch in s):
+            return None
+        total = 0
+        prev = 0
+        for ch in reversed(s):
+            val = roman[ch]
+            if val < prev:
+                total -= val
+            else:
+                total += val
+                prev = val
+        return total if total > 0 else None
+
+    def _extract_chapter_no(text_lc: str, marker_lc: str) -> int | None:
+        # digits: "kapitel 15", "kapitel 15."
+        m = re.search(rf'\b{re.escape(marker_lc)}\s+(\d{{1,3}})\b', text_lc)
+        if m:
+            return int(m.group(1))
+
+        # roman numerals: "kapitel xiv"
+        m = re.search(rf'\b{re.escape(marker_lc)}\s+([ivxlcdm]{{1,12}})\b', text_lc)
+        if m:
+            return _roman_to_int(m.group(1))
+
+        return None
+
+
     for i, line in enumerate(srt_content):
+        if i == (len(srt_content) - 1):
+            continue
+
+        next_text_raw = srt_content[i + 1].strip()
+        next_text_lc = next_text_raw.lower()
+
         if (
-                # Not the end of the list
-                i != (len(srt_content) - 1) and
-                # Doesn't contain an excluded phrase
-                not any(x in srt_content[i+1] for x in excluded_phrases) and
-                # Contains a marker substring
-                any(m in srt_content[i+1] for m in markers)
+            not any(x in next_text_lc for x in excluded_lc) and
+            any(m in next_text_lc for m in markers_lc)
         ):
             if start_regexp := re.search(r'\d\d:\d\d:\d\d,\d+(?=\s-)', line, flags=0):
                 start = start_regexp.group(0).replace(',', '.')
 
                 # Prologue
-                if markers[0] in srt_content[i+1]:
+                if markers_lc[0] in next_text_lc:
                     chapter_type = markers[0].title()
                 # Chapter X
-                elif markers[1] in srt_content[i+1]:
-                    # Add leading zero for better sorting if < 10
-                    chapter_count = f'0{counter}' if counter < 10 else f'{counter}'
-                    chapter_type = f'{markers[1].title()} {chapter_count}'
-                    counter += 1
+                elif markers_lc[1] in next_text_lc:
+                    n = _extract_chapter_no(next_text_lc, markers_lc[1])
+
+                    # If Whisper gave a real number, use it; otherwise fall back to sequential numbering
+                    if n is None:
+                        n = counter
+                        counter += 1
+                    else:
+                        # Keep fallback counter ahead of any extracted numbers
+                        counter = max(counter, n + 1)
+
+                    chapter_type = f'{markers[1].title()} {n:02d}'
+
                 # Epilogue
-                elif markers[2] in srt_content[i+1]:
+                elif markers_lc[2] in next_text_lc:
                     chapter_type = markers[2].title()
                 else:
                     chapter_type = ''
 
-                # Build dict with start codes and marker
                 if len(timecodes) == 0:
                     time_dict = {'start': '00:00:00', 'chapter_type': chapter_type}
                 else:
@@ -834,20 +971,16 @@ def parse_timecodes(srt_content: list, language: str = 'en-us') -> list[dict]:
             else:
                 con.print("[bold yellow]WARNING:[/] A timecode was skipped. A Start time failed to match")
                 continue
-        else:
-            continue
 
-    # Add end key based on end time of next chapter minus one second for overlap
     for i, d in enumerate(timecodes):
         if i != len(timecodes) - 1:
-            d['end'] = convert_time(timecodes[i+1]['start'])
+            d['end'] = convert_time(timecodes[i + 1]['start'])
 
     if timecodes:
         return timecodes
-    else:
-        con.print('[bold red]ERROR:[/] Timecodes list cannot be empty. Exiting...')
-        sys.exit(8)
 
+    con.print('[bold red]ERROR:[/] Timecodes list cannot be empty. Exiting...')
+    sys.exit(8)
 
 def verify_count(audiobook_path: PathLike, timecodes: list[dict]) -> None:
     """Verify that the expected number of files were generated.
@@ -1038,8 +1171,9 @@ def main():
     # If timecodes not parsed from cue file, parse from srt
     if not timecodes:
         # Open file and parse timecodes
-        with open(timecodes_file, 'r') as fp:
-            file_lines = fp.readlines()
+        with open(timecodes_file, 'r', encoding='utf-8-sig', errors='strict') as fp:
+            file_lines = read_text_lines(timecodes_file)
+
         con.rule("[cyan]Parsing Timecodes[/cyan]")
         print("\n")
 

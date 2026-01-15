@@ -70,7 +70,12 @@ model_languages = {
     'Esperanto': 'eo',
     'Hindi': 'hi',
     'Czech': 'cs',
-    'Polish': 'pl'
+    'Polish': 'pl',
+
+    # Danish (Whisper-only; no Vosk model)
+    'Danish': 'da-dk',
+    'Danish (Denmark)': 'da-dk',
+    'Danish Denmark': 'da-dk'
 }
 
 
@@ -83,6 +88,8 @@ model_languages = {
 # Signal phrases for chapter markers
 _markers_english = ('prologue', 'chapter', 'epilogue')
 _markers_german = ('prolog', 'kapitel', 'epilog')
+_markers_danish = ('prolog', 'kapitel', 'epilog')
+
 
 # Some false positive phrases/words that trigger a chapter marker...will need building over time
 _excluded_phrases_english = (
@@ -102,6 +109,12 @@ _excluded_phrases_german = (
 )
 
 
+_excluded_phrases_danish = (
+    # common false positives around “kapitel”
+    'kapitler', 'dette kapitel', 'i dette kapitel', 'i kapitel', 'et kapitel', 'kapitel om',
+    'kapitel af', 'kapitel i', 'kapitel og vers', 'næste kapitel', 'sidste kapitel',
+    'forrige kapitel', 'det kapitel', 'denne kapitel', 'kapiteloverskrift'
+)
 
 def get_lang_from_code(lang: str) -> str:
     """Convert language code to friendly language string.
